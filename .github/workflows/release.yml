@@ -5,229 +5,61 @@ on:
     tags:
       - 'v*'
   workflow_dispatch:
-    inputs:
-      version_name:
-        description: 'versionName, e.g. 1.0.0 (defaults to 1.0.0)'
-        required: false
-        default: ''
-
-concurrency:
-  group: release-${{ github.ref }}
-  cancel-in-progress: false
 
 permissions:
   contents: write
 
 jobs:
   build:
-    name: Build signed APK
     runs-on: ubuntu-latest
 
     steps:
-      # fetch-depth: 0 + fetch-tags: true —— release 正文与模块仓库备注要读 tag 注释；
-      # checkout 默认对触发 ref 用 --no-tags，浅/深克隆都可能读成空。
       - name: Checkout
         uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
-          fetch-tags: true
 
-      - name: Set up JDK 21
+      - name: Set up JDK 17
         uses: actions/setup-java@v4
         with:
-          distribution: temurin
-          java-version: '21'
-
-      - name: Android SDK
-        shell: bash
-        run: |
-          set -euo pipefail
-          echo "ANDROID_HOME=${ANDROID_HOME:-}"
-          echo "ANDROID_SDK_ROOT=${ANDROID_SDK_ROOT:-}"
-          sdkmanager --list_installed 2>/dev/null | head -n 30 || true
-
-      - name: Set up Gradle
-        uses: gradle/actions/setup-gradle@v4
-
-      - name: Resolve versions
-        id: ver
-        shell: bash
-        run: |
-          prerelease=false
-          if [ "${{ github.ref_type }}" = "tag" ]; then
-            name="${GITHUB_REF_NAME#v}"
-            case "$name" in
-              *-pre) prerelease=true; name="${name%-pre}" ;;
-            esac
-          elif [ -n "${{ inputs.version_name }}" ]; then
-            name="${{ inputs.version_name }}"
-          else
-            name="1.0.0"
-          fi
-          # versionCode 用语义版本：major*10000 + minor*100 + patch（1.1.1 → 10101）。
-          # 之前取 run_number（11）比本地构建（14）小，会出现「装不上 / 更新检测认为更旧」。
-          base="${name%%-*}"
-          IFS='.' read -r major minor patch <<< "$base"
-          major="${major:-1}"; minor="${minor:-0}"; patch="${patch:-0}"
-          code=$(( major * 10000 + minor * 100 + patch ))
-          echo "name=$name" >> "$GITHUB_OUTPUT"
-          echo "prerelease=$prerelease" >> "$GITHUB_OUTPUT"
-          echo "code=$code" >> "$GITHUB_OUTPUT"
-          echo "Building FuckBiliAds $name (code $code, prerelease=$prerelease)"
+          distribution: 'temurin'
+          java-version: '17'
 
       - name: Decode keystore
-        shell: bash
         env:
           KEYSTORE_BASE64: ${{ secrets.KEYSTORE_BASE64 }}
         run: |
-          set -euo pipefail
-          if [ -z "${KEYSTORE_BASE64:-}" ]; then
-            echo "::error::KEYSTORE_BASE64 secret is not set"
-            exit 1
-          fi
-          printf '%s' "$KEYSTORE_BASE64" | base64 -d > "$RUNNER_TEMP/release.jks"
-          ls -l "$RUNNER_TEMP/release.jks"
+          echo "$KEYSTORE_BASE64" | base64 -d > "$RUNNER_TEMP/release.jks"
+          echo "KEYSTORE_FILE=$RUNNER_TEMP/release.jks" >> "$GITHUB_ENV"
 
-      - name: Build release APK
-        shell: bash
+      - name: Build release
         env:
-          KEYSTORE_FILE: ${{ runner.temp }}/release.jks
           KEYSTORE_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD }}
           KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
           KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
+          ORG_GRADLE_PROJECT_versionCode: ${{ github.run_number }}
+          ORG_GRADLE_PROJECT_versionName: ${{ github.ref_name }}
         run: |
-          set -euo pipefail
-          chmod +x gradlew
-          ./gradlew :app:assembleRelease --console=plain \
-            -PversionCode="${{ steps.ver.outputs.code }}" \
-            -PversionName="${{ steps.ver.outputs.name }}"
+          chmod +x ./gradlew
+          ./gradlew :app:assembleRelease --no-daemon
 
-      - name: Collect artifact
-        shell: bash
+      - name: Verify permissions (no INTERNET)
         run: |
-          set -euo pipefail
-          apk="$(find app/build/outputs/apk/release -name '*.apk' | head -n 1)"
-          test -n "$apk"
-          cp "$apk" "FuckBiliAds-${{ steps.ver.outputs.name }}.apk"
-          printf '### FuckBiliAds %s\n\n`%s`\n' \
-            "${{ steps.ver.outputs.name }}" "$(sha256sum "FuckBiliAds-${{ steps.ver.outputs.name }}.apk" | cut -d' ' -f1)" \
-            >> "$GITHUB_STEP_SUMMARY"
-
-      - name: Verify signature
-        shell: bash
-        run: |
-          set -euo pipefail
-          apk="FuckBiliAds-${{ steps.ver.outputs.name }}.apk"
-          apksigner="$(find "${ANDROID_SDK_ROOT:-$ANDROID_HOME}/build-tools" -name apksigner 2>/dev/null | sort -V | tail -n 1 || true)"
-          if [ -z "$apksigner" ]; then
-            echo "::warning::apksigner not found, signature check skipped"
-            exit 0
+          APK=$(ls app/build/outputs/apk/release/*.apk | head -n1)
+          echo "APK: $APK"
+          aapt2 dump permissions "$APK" | tee /tmp/perms.txt
+          if grep -qE "android.permission.(INTERNET|ACCESS_NETWORK_STATE)" /tmp/perms.txt; then
+            echo "::error::INTERNET permission still present!"
+            exit 1
           fi
-          "$apksigner" verify --print-certs "$apk"
+          echo "✓ No network permissions found"
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: FuckBiliAds-${{ steps.ver.outputs.name }}
-          path: FuckBiliAds-${{ steps.ver.outputs.name }}.apk
-          if-no-files-found: error
+          name: app-release
+          path: app/build/outputs/apk/release/*.apk
 
-      - name: Publish release
-        if: github.ref_type == 'tag'
+      - name: Create GitHub Release
+        if: startsWith(github.ref, 'refs/tags/')
         uses: softprops/action-gh-release@v2
         with:
-          files: FuckBiliAds-${{ steps.ver.outputs.name }}.apk
-          name: FuckBiliAds v${{ steps.ver.outputs.name }}${{ steps.ver.outputs.prerelease == 'true' && ' · 测试版' || '' }}
-          generate_release_notes: true
-          # 删除 tag 会把关联 release 变成 draft，重推 tag 不会自动恢复；
-          # 这里显式写 false，避免发布页停在 Draft。
-          draft: false
-          prerelease: ${{ steps.ver.outputs.prerelease == 'true' }}
-          fail_on_unmatched_files: true
-
-      # 先同步到模块仓库（用户下载入口），再做正文修补，避免正文步骤失败拖累分发。
-      - name: Sync to Xposed module repository
-        if: github.ref_type == 'tag' && steps.ver.outputs.prerelease != 'true'
-        shell: bash
-        env:
-          MODULE_REPO_TOKEN: ${{ secrets.MODULE_REPO_TOKEN }}
-          VERSION_NAME: ${{ steps.ver.outputs.name }}
-          VERSION_CODE: ${{ steps.ver.outputs.code }}
-          TAG_NAME: ${{ github.ref_name }}
-        run: |
-          set -euo pipefail
-          if [ -z "${MODULE_REPO_TOKEN:-}" ]; then
-            echo "::notice::MODULE_REPO_TOKEN 未配置，跳过 Xposed 模块仓库同步"
-            exit 0
-          fi
-          repo="Xposed-Modules-Repo/io.github.fesht377.biliads"
-          tag="${VERSION_CODE}-${VERSION_NAME}"
-          apk="FuckBiliAds-${VERSION_NAME}.apk"
-          export GH_TOKEN="$MODULE_REPO_TOKEN"
-          if gh release view "$tag" --repo "$repo" >/dev/null 2>&1; then
-            echo "release $tag 已存在，覆盖 asset"
-            gh release upload "$tag" "$apk" --repo "$repo" --clobber
-          else
-            notes="$(git tag -l --format='%(contents)' "$TAG_NAME" 2>/dev/null || true)"
-            [ -n "$notes" ] || notes="$(git log -1 --pretty=%B)"
-            gh release create "$tag" "$apk" --repo "$repo" \
-              --title "$VERSION_NAME" --notes "${notes:-FuckBiliAds $VERSION_NAME}"
-          fi
-          echo "已同步到 $repo $tag"
-
-      # softprops/action-gh-release 的 append_body 只在「更新已有 release」时生效，
-      # 新建 release 时会被 generate_release_notes 的结果覆盖，于是正文里从来没有
-      # 「versionCode: N」。应用内更新检查（UpdateChecker.parseVersionCode）依赖这行
-      # 判断同名版本的新旧（1.2.0-pre 44 vs 1.2.0 45）。这里用 tag 注释重建正文：
-      #   <tag 注释>
-      #   **Full Changelog**: ...
-      #   ---
-      #   versionCode: N
-      - name: Append versionCode to release body
-        if: github.ref_type == 'tag'
-        shell: bash
-        env:
-          GH_TOKEN: ${{ github.token }}
-          TAG: ${{ github.ref_name }}
-          CODE: ${{ steps.ver.outputs.code }}
-        run: |
-          set -euo pipefail
-          # 注意：releases/tags/{tag} 只支持 GET，PATCH 必须走 releases/{id}。
-          release_id="$(gh api "repos/$GITHUB_REPOSITORY/releases/tags/$TAG" -q .id)"
-          if [ -z "$release_id" ]; then
-            echo "::error::cannot resolve release id for $TAG"
-            exit 1
-          fi
-          current="$(gh api "repos/$GITHUB_REPOSITORY/releases/$release_id" -q .body)"
-          # 直接从 API 读 tag 注释：checkout 对触发 ref 用 --no-tags，
-          # 即便 fetch-depth: 0，%(contents) 也常常是空的。
-          tag_notes=""
-          ref_json="$(gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$TAG" 2>/dev/null || true)"
-          if [ -n "$ref_json" ]; then
-            ref_sha="$(printf '%s' "$ref_json" | jq -r '.object.sha')"
-            ref_type="$(printf '%s' "$ref_json" | jq -r '.object.type')"
-            if [ "$ref_type" = "tag" ]; then
-              tag_notes="$(gh api "repos/$GITHUB_REPOSITORY/git/tags/$ref_sha" -q .message || true)"
-            fi
-          fi
-          if [ -z "$tag_notes" ]; then
-            tag_notes="$(git tag -l --format='%(contents)' "$TAG" 2>/dev/null || true)"
-          fi
-          tag_notes="$(printf '%s' "$tag_notes" | sed -e 's/[[:space:]]*$//')"
-          if [ -z "$tag_notes" ]; then
-            echo "::warning::tag $TAG 没有注释，退回提交标题"
-            tag_notes="$(git log -1 --pretty=%s)"
-          fi
-          # 正文 = tag 注释 + 上游生成的 changelog 行；不累积旧正文，重复运行结果一致。
-          body="$tag_notes"
-          # 只认 markdown 链接那一行，避免匹配到提交说明里的 “Full Changelog” 字样。
-          changelog="$(printf '%s\n' "$current" | grep -m1 '^\*\*Full Changelog\*\*:' || true)"
-          if [ -n "$changelog" ]; then
-            body="$(printf '%s\n\n%s' "$body" "$changelog")"
-          fi
-          body="$(printf '%s\n\n---\nversionCode: %s' "$body" "$CODE")"
-          printf '%s\n' "$body" > "$RUNNER_TEMP/release-notes.md"
-          # draft=false：删除 tag 会把 release 变成 draft，重推 tag 后要显式恢复。
-          gh api -X PATCH "repos/$GITHUB_REPOSITORY/releases/$release_id" \
-            -F body=@"$RUNNER_TEMP/release-notes.md" -F draft=false > /dev/null
-          echo "draft=$(gh api "repos/$GITHUB_REPOSITORY/releases/$release_id" -q .draft) versionCode=${CODE}"
+          files: app/build/outputs/apk/release/*.apk
